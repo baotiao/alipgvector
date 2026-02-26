@@ -1,5 +1,7 @@
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "access/genam.h"
 #include "access/relscan.h"
 #include "hnsw.h"
