@@ -50,7 +50,9 @@
 #include "catalog/pg_type_d.h"
 #include "commands/progress.h"
 #include "hnsw.h"
+#include "hnswrabitq.h"
 #include "miscadmin.h"
+#include "vector.h"
 #include "nodes/execnodes.h"
 #include "optimizer/optimizer.h"
 #include "storage/bufmgr.h"
@@ -108,8 +110,109 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
+
+	/* RaBitQ fields */
+	metap->rabitqEnabled = buildstate->rabitqEnabled ? 1 : 0;
+	memset(metap->rabitqPadding, 0, sizeof(metap->rabitqPadding));
+	metap->rabitqSeed = 0;
+	metap->centroidBlkno = InvalidBlockNumber;
+
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
+
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Compute centroid from all in-memory elements
+ */
+static void
+ComputeCentroid(HnswBuildState * buildstate, float *centroid, int dim)
+{
+	HnswElementPtr iter = buildstate->graph->head;
+	char	   *base = buildstate->hnswarea;
+	int			count = 0;
+
+	memset(centroid, 0, sizeof(float) * dim);
+
+	while (!HnswPtrIsNull(base, iter))
+	{
+		HnswElement element = HnswPtrAccess(base, iter);
+		Pointer		valuePtr = HnswPtrAccess(base, element->value);
+		Vector	   *vec = (Vector *) valuePtr;
+
+		for (int i = 0; i < dim; i++)
+			centroid[i] += vec->x[i];
+
+		count++;
+		iter = element->next;
+	}
+
+	if (count > 0)
+	{
+		float		inv = 1.0f / (float) count;
+
+		for (int i = 0; i < dim; i++)
+			centroid[i] *= inv;
+	}
+}
+
+/*
+ * Create centroid page
+ */
+static BlockNumber
+CreateCentroidPage(HnswBuildState * buildstate, float *centroid, int dim)
+{
+	Relation	index = buildstate->index;
+	ForkNumber	forkNum = buildstate->forkNum;
+	Buffer		buf;
+	Page		page;
+	uint32	   *dimPtr;
+	float	   *dataPtr;
+
+	buf = HnswNewBuffer(index, forkNum);
+	page = BufferGetPage(buf);
+	HnswInitPage(buf, page);
+
+	/* Write dim + centroid data */
+	dimPtr = (uint32 *) PageGetContents(page);
+	*dimPtr = dim;
+	dataPtr = (float *) ((char *) dimPtr + sizeof(uint32));
+	memcpy(dataPtr, centroid, sizeof(float) * dim);
+
+	((PageHeader) page)->pd_lower =
+		((char *) dataPtr + sizeof(float) * dim) - (char *) page;
+
+	MarkBufferDirty(buf);
+
+	{
+		BlockNumber blkno = BufferGetBlockNumber(buf);
+
+		UnlockReleaseBuffer(buf);
+		return blkno;
+	}
+}
+
+/*
+ * Update metapage with RaBitQ seed and centroid block
+ */
+static void
+UpdateMetaPageRaBitQ(HnswBuildState * buildstate, uint64 seed, BlockNumber centroidBlkno)
+{
+	Relation	index = buildstate->index;
+	ForkNumber	forkNum = buildstate->forkNum;
+	Buffer		buf;
+	Page		page;
+	HnswMetaPage metap;
+
+	buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	metap = HnswPageGetMeta(page);
+
+	metap->rabitqSeed = seed;
+	metap->centroidBlkno = centroidBlkno;
 
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
@@ -147,19 +250,22 @@ HnswBuildAppendPage(Relation index, Buffer *buf, Page *page, ForkNumber forkNum)
  * Create graph pages
  */
 static void
-CreateGraphPages(HnswBuildState * buildstate)
+CreateGraphPages(HnswBuildState * buildstate, HnswRaBitQState * rqState)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
 	Size		maxSize;
 	HnswElementTuple etup;
 	HnswNeighborTuple ntup;
+	HnswRaBitQTuple rtup = NULL;
 	BlockNumber insertPage;
 	HnswElement entryPoint;
 	Buffer		buf;
 	Page		page;
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
+	bool		rabitq = buildstate->rabitqEnabled && rqState != NULL;
+	Size		rtupAllocSize = 0;
 
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
@@ -167,6 +273,12 @@ CreateGraphPages(HnswBuildState * buildstate)
 	/* Allocate once */
 	etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+
+	if (rabitq)
+	{
+		rtupAllocSize = HNSW_RABITQ_TUPLE_SIZE(buildstate->dimensions);
+		rtup = palloc0(rtupAllocSize);
+	}
 
 	/* Prepare first page */
 	buf = HnswNewBuffer(index, forkNum);
@@ -178,6 +290,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		HnswElement element = HnswPtrAccess(base, iter);
 		Size		etupSize;
 		Size		ntupSize;
+		Size		rtupSize = 0;
 		Size		combinedSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
@@ -190,7 +303,14 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Calculate sizes */
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
-		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+
+		if (rabitq)
+		{
+			rtupSize = HNSW_RABITQ_TUPLE_SIZE(buildstate->dimensions);
+			combinedSize = etupSize + rtupSize + ntupSize + 3 * sizeof(ItemIdData);
+		}
+		else
+			combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
 		/* Initial size check */
 		if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
@@ -200,6 +320,20 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 		HnswSetElementTuple(base, etup, element);
 
+		/* Quantize vector if rabitq enabled */
+		if (rabitq)
+		{
+			Vector	   *vec = (Vector *) valuePtr;
+
+			MemSet(rtup, 0, rtupAllocSize);
+			rtup->type = HNSW_RABITQ_TUPLE_TYPE;
+			rtup->version = element->version;
+			rtup->dim = buildstate->dimensions;
+			HnswRaBitQQuantize(rqState, vec->x, buildstate->dimensions,
+							   &rtup->norm_r, &rtup->ip_oo_bar,
+							   rtup->code);
+		}
+
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
 			HnswBuildAppendPage(index, &buf, &page, forkNum);
@@ -207,15 +341,36 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Calculate offsets */
 		element->blkno = BufferGetBlockNumber(buf);
 		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
-		if (combinedSize <= maxSize)
+
+		if (rabitq)
 		{
-			element->neighborPage = element->blkno;
-			element->neighborOffno = OffsetNumberNext(element->offno);
+			/*
+			 * Layout: element at offno, rabitq at offno+1, neighbor at
+			 * offno+2 (or next page)
+			 */
+			if (combinedSize <= maxSize)
+			{
+				element->neighborPage = element->blkno;
+				element->neighborOffno = OffsetNumberNext(OffsetNumberNext(element->offno));
+			}
+			else
+			{
+				element->neighborPage = element->blkno + 1;
+				element->neighborOffno = FirstOffsetNumber;
+			}
 		}
 		else
 		{
-			element->neighborPage = element->blkno + 1;
-			element->neighborOffno = FirstOffsetNumber;
+			if (combinedSize <= maxSize)
+			{
+				element->neighborPage = element->blkno;
+				element->neighborOffno = OffsetNumberNext(element->offno);
+			}
+			else
+			{
+				element->neighborPage = element->blkno + 1;
+				element->neighborOffno = FirstOffsetNumber;
+			}
 		}
 
 		ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
@@ -224,9 +379,31 @@ CreateGraphPages(HnswBuildState * buildstate)
 		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
+		/* Add rabitq tuple if enabled */
+		if (rabitq)
+		{
+			OffsetNumber rabitqOffno = OffsetNumberNext(element->offno);
+
+			/*
+			 * RaBitQ tuple must stay adjacent to element (offno + 1) so scans
+			 * can load it without indirection.
+			 */
+			if (PageGetFreeSpace(page) < rtupSize)
+				elog(ERROR, "insufficient space for RaBitQ tuple on element page");
+
+			if (PageAddItem(page, (Item) rtup, rtupSize, InvalidOffsetNumber, false, false) != rabitqOffno)
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+		}
+
 		/* Add new page if needed */
 		if (PageGetFreeSpace(page) < ntupSize)
+		{
+			/* Same-page placement was precomputed above for this branch */
+			if (rabitq && combinedSize <= maxSize)
+				elog(ERROR, "insufficient space for neighbor tuple after RaBitQ layout planning");
+
 			HnswBuildAppendPage(index, &buf, &page, forkNum);
+		}
 
 		/* Add placeholder for neighbors */
 		if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
@@ -244,6 +421,8 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 	pfree(etup);
 	pfree(ntup);
+	if (rtup)
+		pfree(rtup);
 }
 
 /*
@@ -302,13 +481,61 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 static void
 FlushPages(HnswBuildState * buildstate)
 {
+	HnswRaBitQState *rqState = NULL;
+
 #ifdef HNSW_MEMORY
 	elog(INFO, "memory: %zu MB", buildstate->graph->memoryUsed / (1024 * 1024));
 #endif
 
 	CreateMetaPage(buildstate);
-	CreateGraphPages(buildstate);
+
+	/* RaBitQ: compute centroid and prepare quantization state */
+	if (buildstate->rabitqEnabled && buildstate->dimensions > 0)
+	{
+		float	   *centroid;
+		uint64		seed;
+		int			dim = buildstate->dimensions;
+		int			padded;
+
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_CENTROID);
+
+		centroid = palloc0(sizeof(float) * dim);
+		ComputeCentroid(buildstate, centroid, dim);
+
+		/* Generate a seed */
+		seed = (uint64) random() ^ ((uint64) random() << 32);
+
+		/* Build RaBitQ state for quantization */
+		padded = 1;
+		while (padded < dim)
+			padded <<= 1;
+
+		rqState = palloc(sizeof(HnswRaBitQState));
+		rqState->enabled = true;
+		rqState->dim = dim;
+		rqState->seed = seed;
+		rqState->centroid = centroid;
+		rqState->diag1 = palloc(sizeof(float) * padded);
+		rqState->diag2 = palloc(sizeof(float) * padded);
+		rqState->diag3 = palloc(sizeof(float) * padded);
+		HnswRaBitQGenerateDiagonals(seed, padded, rqState->diag1, rqState->diag2, rqState->diag3);
+
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_QUANTIZE);
+	}
+
+	CreateGraphPages(buildstate, rqState);
 	WriteNeighborTuples(buildstate);
+
+	if (rqState)
+	{
+		BlockNumber centroidBlkno;
+
+		/* Keep centroid outside graph page chain (head starts at block 1). */
+		centroidBlkno = CreateCentroidPage(buildstate, rqState->centroid, rqState->dim);
+		UpdateMetaPageRaBitQ(buildstate, rqState->seed, centroidBlkno);
+
+		HnswRaBitQFreeState(rqState);
+	}
 
 	buildstate->graph->flushed = true;
 	MemoryContextReset(buildstate->graphCtx);
@@ -689,6 +916,7 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->m = HnswGetM(index);
 	buildstate->efConstruction = HnswGetEfConstruction(index);
 	buildstate->dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
+	buildstate->rabitqEnabled = HnswGetRaBitQ(index);
 
 	/* Disallow varbit since require fixed dimensions */
 	if (TupleDescAttr(index->rd_att, 0)->atttypid == VARBITOID)

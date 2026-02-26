@@ -158,7 +158,9 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 	page = BufferGetPage(buf);
 	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
 
-	Assert(HnswIsNeighborTuple(ntup));
+	if (!HnswIsNeighborTuple(ntup))
+		elog(ERROR, "hnsw index is corrupted: expected neighbor tuple at (%u,%u)",
+			 element->neighborPage, element->neighborOffno);
 
 	/* Check neighbors */
 	for (int i = 0; i < ntup->count; i++)
@@ -532,6 +534,12 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			}
 
 			ntup = (HnswNeighborTuple) PageGetItem(npage, PageGetItemId(npage, neighborOffno));
+			if (!HnswIsNeighborTuple(ntup))
+				elog(ERROR, "hnsw index is corrupted: expected neighbor tuple at (%u,%u)",
+					 neighborPage, neighborOffno);
+			if (ntup->count != (etup->level + 2) * vacuumstate->m)
+				elog(ERROR, "hnsw index is corrupted: invalid neighbor tuple count at (%u,%u)",
+					 neighborPage, neighborOffno);
 
 			/* Overwrite element */
 			/* Use memset instead of MemSet to keep clang-tidy happy */
@@ -605,6 +613,9 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 
 	/* Get m from metapage */
 	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL);
+
+	/* Check if RaBitQ is enabled */
+	vacuumstate->rabitqEnabled = HnswGetRaBitQ(index);
 
 	/* Create hash table */
 	vacuumstate->deleted = tidhash_create(CurrentMemoryContext, 256, NULL);
