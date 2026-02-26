@@ -3,12 +3,14 @@
 #include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "hnsw.h"
+#include "hnswrabitq.h"
 #include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "vector.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -141,7 +143,7 @@ HnswInsertAppendPage(Relation index, Buffer *nbuf, Page *npage, GenericXLogState
  * Add to element and neighbor pages
  */
 static void
-AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, BlockNumber *updatedInsertPage, bool building)
+AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, BlockNumber *updatedInsertPage, bool building, HnswRaBitQTuple rtup, Size rtupSize)
 {
 	Buffer		buf;
 	Page		page;
@@ -165,9 +167,15 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	/* Calculate sizes */
 	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
-	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+	if (rtup != NULL)
+		combinedSize = etupSize + rtupSize + ntupSize + 2 * sizeof(ItemIdData);
+	else
+		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
-	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m) + sizeof(ItemIdData);
+	if (rtup != NULL)
+		minCombinedSize = etupSize + rtupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m) + 2 * sizeof(ItemIdData);
+	else
+		minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m) + sizeof(ItemIdData);
 
 	/* Prepare element tuple */
 	etup = palloc0(etupSize);
@@ -222,6 +230,8 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 			/* Set tuple version */
 			etup->version = tupleVersion;
 			ntup->version = tupleVersion;
+			if (rtup != NULL)
+				rtup->version = tupleVersion;
 
 			break;
 		}
@@ -302,7 +312,12 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	{
 		e->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
 		if (nbuf == buf)
-			e->neighborOffno = OffsetNumberNext(e->offno);
+		{
+			if (rtup != NULL)
+				e->neighborOffno = OffsetNumberNext(OffsetNumberNext(e->offno));
+			else
+				e->neighborOffno = OffsetNumberNext(e->offno);
+		}
 		else
 			e->neighborOffno = FirstOffsetNumber;
 	}
@@ -315,6 +330,14 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 		if (!PageIndexTupleOverwrite(page, e->offno, (Item) etup, etupSize))
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
+		if (rtup != NULL)
+		{
+			OffsetNumber rabitqOffno = OffsetNumberNext(e->offno);
+
+			if (!PageIndexTupleOverwrite(page, rabitqOffno, (Item) rtup, rtupSize))
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+		}
+
 		if (!PageIndexTupleOverwrite(npage, e->neighborOffno, (Item) ntup, ntupSize))
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 	}
@@ -322,6 +345,15 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	{
 		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != e->offno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+		/* Add rabitq tuple after element */
+		if (rtup != NULL)
+		{
+			OffsetNumber rabitqOffno = OffsetNumberNext(e->offno);
+
+			if (PageAddItem(page, (Item) rtup, rtupSize, InvalidOffsetNumber, false, false) != rabitqOffno)
+				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+		}
 
 		if (PageAddItem(npage, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != e->neighborOffno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
@@ -662,10 +694,10 @@ FindDuplicateOnDisk(Relation index, HnswElement element, bool building)
 }
 
 /*
- * Update graph on disk
+ * Update graph on disk with optional RaBitQ tuple
  */
 static void
-UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, int m, HnswElement entryPoint, bool building)
+UpdateGraphOnDiskRaBitQ(Relation index, HnswSupport * support, HnswElement element, int m, HnswElement entryPoint, bool building, HnswRaBitQTuple rtup, Size rtupSize)
 {
 	BlockNumber newInsertPage = InvalidBlockNumber;
 
@@ -674,7 +706,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 		return;
 
 	/* Add element */
-	AddElementOnDisk(index, element, m, GetInsertPage(index), &newInsertPage, building);
+	AddElementOnDisk(index, element, m, GetInsertPage(index), &newInsertPage, building, rtup, rtupSize);
 
 	/* Update insert page if needed */
 	if (BlockNumberIsValid(newInsertPage))
@@ -700,6 +732,8 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	int			efConstruction = HnswGetEfConstruction(index);
 	LOCKMODE	lockmode = ShareLock;
 	char	   *base = NULL;
+	HnswRaBitQTuple rtup = NULL;
+	Size		rtupSize = 0;
 
 	/*
 	 * Get a shared lock. This allows vacuum to ensure no in-flight inserts
@@ -714,6 +748,27 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
 	HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
+
+	/* Quantize with RaBitQ if enabled */
+	{
+		HnswRaBitQState *rqState = HnswRaBitQLoadState(index);
+
+		if (rqState != NULL)
+		{
+			Vector	   *vec = (Vector *) DatumGetPointer(value);
+			int			dim = rqState->dim;
+
+			rtupSize = HNSW_RABITQ_TUPLE_SIZE(dim);
+			rtup = palloc0(rtupSize);
+			rtup->type = HNSW_RABITQ_TUPLE_TYPE;
+			rtup->version = element->version;
+			rtup->dim = dim;
+			HnswRaBitQQuantize(rqState, vec->x, dim,
+							   &rtup->norm_r, &rtup->ip_oo_bar,
+							   rtup->code);
+			HnswRaBitQFreeState(rqState);
+		}
+	}
 
 	/* Prevent concurrent inserts when likely updating entry point */
 	if (entryPoint == NULL || element->level > entryPoint->level)
@@ -733,10 +788,13 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false);
 
 	/* Update graph on disk */
-	UpdateGraphOnDisk(index, support, element, m, entryPoint, building);
+	UpdateGraphOnDiskRaBitQ(index, support, element, m, entryPoint, building, rtup, rtupSize);
 
 	/* Release lock */
 	UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
+
+	if (rtup)
+		pfree(rtup);
 
 	return true;
 }

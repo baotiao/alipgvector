@@ -36,6 +36,7 @@ int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
+double		hnsw_rabitq_rerank;
 static relopt_kind hnsw_relopt_kind;
 
 /*
@@ -88,6 +89,8 @@ HnswInit(void)
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+	add_bool_reloption(hnsw_relopt_kind, "rabitq", "Enable RaBitQ quantization for faster search",
+					   false, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -107,6 +110,10 @@ HnswInit(void)
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomRealVariable("hnsw.rabitq_rerank", "Sets the reranking multiplier for RaBitQ quantized search",
+							 "Valid range is 1.0..10.0.", &hnsw_rabitq_rerank,
+							 2.0, 1.0, 10.0, PGC_USERSET, 0, NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("hnsw");
 }
 
@@ -122,6 +129,10 @@ hnswbuildphasename(int64 phasenum)
 			return "initializing";
 		case PROGRESS_HNSW_PHASE_LOAD:
 			return "loading tuples";
+		case PROGRESS_HNSW_PHASE_CENTROID:
+			return "computing centroid";
+		case PROGRESS_HNSW_PHASE_QUANTIZE:
+			return "quantizing vectors";
 		default:
 			return NULL;
 	}
@@ -240,6 +251,7 @@ hnswoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
+		{"rabitq", RELOPT_TYPE_BOOL, offsetof(HnswOptions, rabitq)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

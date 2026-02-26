@@ -26,7 +26,7 @@ typedef Pointer Item;
 #define HNSW_NORM_PROC 2
 #define HNSW_TYPE_INFO_PROC 3
 
-#define HNSW_VERSION	1
+#define HNSW_VERSION	2
 #define HNSW_MAGIC_NUMBER 0xA953A953
 #define HNSW_PAGE_ID	0xFF90
 
@@ -62,6 +62,8 @@ typedef Pointer Item;
 /* Build phases */
 /* PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE is 1 */
 #define PROGRESS_HNSW_PHASE_LOAD		2
+#define PROGRESS_HNSW_PHASE_CENTROID	3
+#define PROGRESS_HNSW_PHASE_QUANTIZE	4
 
 #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
@@ -119,6 +121,7 @@ extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
+extern double hnsw_rabitq_rerank;
 
 typedef enum HnswIterativeScanMode
 {
@@ -189,6 +192,7 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	bool		rabitq;			/* enable RaBitQ quantization */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -305,6 +309,9 @@ typedef struct HnswBuildState
 	HnswLeader *hnswleader;
 	HnswShared *hnswshared;
 	char	   *hnswarea;
+
+	/* RaBitQ */
+	bool		rabitqEnabled;
 }			HnswBuildState;
 
 typedef struct HnswMetaPageData
@@ -318,6 +325,11 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	/* RaBitQ fields (version >= 2) */
+	uint8		rabitqEnabled;
+	uint8		rabitqPadding[3];
+	uint64		rabitqSeed;
+	BlockNumber centroidBlkno;
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -368,6 +380,10 @@ typedef union
 	ItemPointerData indextid;
 }			HnswUnvisited;
 
+/* Forward declarations for RaBitQ */
+typedef struct HnswRaBitQState HnswRaBitQState;
+typedef struct HnswRaBitQQueryState HnswRaBitQQueryState;
+
 typedef struct HnswScanOpaqueData
 {
 	const		HnswTypeInfo *typeInfo;
@@ -384,6 +400,10 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	/* RaBitQ */
+	HnswRaBitQState *rqState;
+	HnswRaBitQQueryState *rqQuery;
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -411,11 +431,15 @@ typedef struct HnswVacuumState
 
 	/* Memory */
 	MemoryContext tmpCtx;
+
+	/* RaBitQ */
+	bool		rabitqEnabled;
 }			HnswVacuumState;
 
 /* Methods */
 int			HnswGetM(Relation index);
 int			HnswGetEfConstruction(Relation index);
+bool		HnswGetRaBitQ(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
@@ -423,7 +447,7 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
+List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, HnswRaBitQState *rqState, HnswRaBitQQueryState *rqQuery);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);

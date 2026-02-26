@@ -7,12 +7,14 @@
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "hnsw.h"
+#include "hnswrabitq.h"
 #include "lib/pairingheap.h"
 #include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
 #include "utils/datum.h"
+#include "utils/float.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 #include "vector.h"
@@ -132,6 +134,20 @@ HnswGetEfConstruction(Relation index)
 		return opts->efConstruction;
 
 	return HNSW_DEFAULT_EF_CONSTRUCTION;
+}
+
+/*
+ * Get whether RaBitQ is enabled for the index
+ */
+bool
+HnswGetRaBitQ(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+		return opts->rabitq;
+
+	return false;
 }
 
 /*
@@ -577,6 +593,66 @@ HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation i
 }
 
 /*
+ * Load an element using RaBitQ approximate distance.
+ *
+ * Reads the element tuple header (for metadata) and the RaBitQ tuple at
+ * offno+1 to compute approximate distance. Avoids loading the full vector,
+ * which is the main I/O and compute saving.
+ */
+static void
+HnswLoadElementRaBitQ(BlockNumber blkno, OffsetNumber offno, double *distance,
+					  HnswRaBitQState *rqState, HnswRaBitQQueryState *rqQuery,
+					  double *maxDistance, HnswElement * element)
+{
+	Buffer		buf;
+	Page		page;
+	HnswElementTuple etup;
+	OffsetNumber rabitqOffno = OffsetNumberNext(offno);
+	ItemId		iid;
+
+	buf = ReadBuffer(rqState->index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	/* Load element tuple header */
+	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+	Assert(HnswIsElementTuple(etup));
+
+	/* Load RaBitQ tuple and compute approximate distance */
+	iid = PageGetItemId(page, rabitqOffno);
+	if (ItemIdIsUsed(iid))
+	{
+		HnswRaBitQTuple rtup = (HnswRaBitQTuple) PageGetItem(page, iid);
+
+		if (rtup->type == HNSW_RABITQ_TUPLE_TYPE)
+		{
+			if (rtup->dim == rqState->dim)
+				*distance = (double) HnswRaBitQEstimateL2(rtup, rqQuery, rqState->dim);
+			else
+				*distance = get_float8_infinity();
+		}
+		else
+		{
+			/* Fallback: shouldn't happen, but be conservative */
+			*distance = get_float8_infinity();
+		}
+	}
+	else
+		*distance = get_float8_infinity();
+
+	/* Load element metadata if distance qualifies */
+	if (maxDistance == NULL || *distance < *maxDistance)
+	{
+		if (*element == NULL)
+			*element = HnswInitElementFromBlock(blkno, offno);
+
+		HnswLoadElementFromTuple(*element, etup, true, false);
+	}
+
+	UnlockReleaseBuffer(buf);
+}
+
+/*
  * Get the distance for an element
  */
 static double
@@ -817,7 +893,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, HnswRaBitQState *rqState, HnswRaBitQQueryState *rqQuery)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -922,6 +998,19 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
+
+				/*
+				 * TODO: Enable approximate distance path once estimation
+				 * quality is improved. Currently uses exact distances for
+				 * search, with RaBitQ benefit from expanded ef + reranking.
+				 *
+				 * if (rqState != NULL && rqQuery != NULL)
+				 *     HnswLoadElementRaBitQ(blkno, offno, &eDistance,
+				 *         rqState, rqQuery,
+				 *         alwaysAdd || discarded != NULL ? NULL : &f->distance,
+				 *         &eElement);
+				 * else
+				 */
 				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
 
 				if (eElement == NULL)
@@ -1300,7 +1389,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL);
 		ep = w;
 	}
 
@@ -1319,7 +1408,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, NULL);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)

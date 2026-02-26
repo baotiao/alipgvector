@@ -1,0 +1,118 @@
+SET enable_seqscan = off;
+-- Basic RaBitQ index build and search (L2)
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (rabitq = true);
+INSERT INTO t (val) VALUES ('[1,2,4]');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val
+---------
+ [1,2,4]
+ [1,2,3]
+ [1,1,1]
+ [0,0,0]
+(4 rows)
+
+SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <-> (SELECT NULL::vector)) t2;
+ count
+-------
+     4
+(1 row)
+
+SELECT COUNT(*) FROM t;
+ count
+-------
+     5
+(1 row)
+
+DROP TABLE t;
+-- RaBitQ with higher dimensions
+CREATE TABLE t (val vector(10));
+INSERT INTO t (val) VALUES
+  ('[1,2,3,4,5,6,7,8,9,10]'),
+  ('[10,9,8,7,6,5,4,3,2,1]'),
+  ('[5,5,5,5,5,5,5,5,5,5]'),
+  ('[0,0,0,0,0,0,0,0,0,0]'),
+  ('[1,1,1,1,1,1,1,1,1,1]');
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (rabitq = true, m = 4, ef_construction = 16);
+SELECT * FROM t ORDER BY val <-> '[5,5,5,5,5,5,5,5,5,5]' LIMIT 3;
+            val
+---------------------------
+ [5,5,5,5,5,5,5,5,5,5]
+ [1,2,3,4,5,6,7,8,9,10]
+ [10,9,8,7,6,5,4,3,2,1]
+(3 rows)
+
+DROP TABLE t;
+-- RaBitQ with custom parameters
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+-- Test rabitq = false (default)
+CREATE INDEX idx_no_rabitq ON t USING hnsw (val vector_l2_ops);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val
+---------
+ [1,2,3]
+ [1,1,1]
+ [0,0,0]
+(3 rows)
+
+DROP INDEX idx_no_rabitq;
+-- Test rabitq = true
+CREATE INDEX idx_rabitq ON t USING hnsw (val vector_l2_ops) WITH (rabitq = true);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val
+---------
+ [1,2,3]
+ [1,1,1]
+ [0,0,0]
+(3 rows)
+
+DROP INDEX idx_rabitq;
+DROP TABLE t;
+-- Test GUC parameter
+SET hnsw.rabitq_rerank = 3.0;
+SHOW hnsw.rabitq_rerank;
+ hnsw.rabitq_rerank
+--------------------
+ 3
+(1 row)
+
+SET hnsw.rabitq_rerank = 2.0;
+-- RaBitQ insert after build
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (rabitq = true);
+-- Insert after index is built
+INSERT INTO t (val) VALUES ('[2,2,2]'), ('[3,3,3]');
+SELECT * FROM t ORDER BY val <-> '[2,2,2]' LIMIT 3;
+   val
+---------
+ [2,2,2]
+ [1,1,1]
+ [1,2,3]
+(3 rows)
+
+DROP TABLE t;
+-- RaBitQ with empty table
+CREATE TABLE t (val vector(3));
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (rabitq = true);
+INSERT INTO t (val) VALUES ('[1,2,3]');
+SELECT * FROM t ORDER BY val <-> '[0,0,0]';
+   val
+---------
+ [1,2,3]
+(1 row)
+
+DROP TABLE t;
+-- RaBitQ with TRUNCATE
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (rabitq = true);
+TRUNCATE t;
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+ val
+-----
+(0 rows)
+
+DROP TABLE t;
